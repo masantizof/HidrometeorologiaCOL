@@ -1,482 +1,362 @@
-#!/usr/bin/env python
-# coding: utf-8
+"""
+balance_hidrico_multianual_v3_abcd.py
 
-# In[2]:
+Genera el BALANCE HÍDRICO MENSUAL MULTIANUAL + MODELO DE CAUDALES ABCD.
 
+1. Calcula Climatología (Promedio Ene-Dic) de Precipitación.
+2. Calcula PET usando Thornthwaite.
+3. Ejecuta Balance Clásico (Thornthwaite) para Clasificación Climática.
+4. Ejecuta Modelo ABCD para estimar Escorrentía Directa y Flujo Base.
+5. Genera reportes (Excel/CSV) y gráficos integrados.
+"""
 
-pip install xarray netCDF4
-
-
-# In[5]:
-
-
-import pandas as pd
-import numpy as np
 import os
-import matplotlib.pyplot as plt
-import seaborn as sns
-from scipy.interpolate import Rbf
-from matplotlib.path import Path
-import geopandas as gpd
-
-# ---------------------------------------------------------
-# 1. CONFIGURACIÓN (Rutas y Filtros)
-# ---------------------------------------------------------
-FOLDER_PATH = r'C:\Users\masan\OneDrive\Documentos\Maestria Meteo\2025-II\HIDROMETEOROLOGIA\Cuenca\Estaciones pluvio'
-RUTA_SHP = r'C:\Users\masan\OneDrive\Documentos\Maestria Meteo\2025-II\HIDROMETEOROLOGIA\Cuenca\Datos_Estaciones\Subzonas_Hidrográficas_del_Departamento_del_Tolima.shp'
-
-# Filtro de Cuencaw
-NOMBRE_COLUMNA_SHP = 'SUBZONA_HI' 
-NOMBRE_CUENCA_OBJETIVO = 'Rio Cucuana' 
-
-# FILTRO TEMPORAL (Ajusta esto para análisis multianual)
-FILTRAR_FECHA = True
-FECHA_INICIO = '2000-01-01'  # Sugerencia: Usar periodos largos (ej: 1980)
-FECHA_FIN = '2020-12-31'     # Sugerencia: Usar periodos largos (ej: 2010)
-
-# Coeficiente de Escorrentía
-COEF_ESCORRENTIA = 0.65
-
-NOMBRES_MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
-
-# Estaciones
-estaciones_info = {
-    '22075030': {'NOMBRE': 'RIOMANSO', 'LATITUD': 4.2067777780, 'LONGITUD': -75.41558333},
-    '22060090': {'NOMBRE': 'OLAYA HERRERA', 'LATITUD': 3.819890, 'LONGITUD': -75.3284},
-    '22060070': {'NOMBRE': 'ORTEGA', 'LATITUD': 3.929290, 'LONGITUD': -75.221350},
-    '22070030': {'NOMBRE': 'SANTA HELENA', 'LATITUD': 4.1245555560, 'LONGITUD': -75.49952778},
-    '21180040': {'NOMBRE': 'ROVIRA 2', 'LATITUD': 4.2425, 'LONGITUD': -75.2425},
-    '22070010': {'NOMBRE': 'RONCESVALLES', 'LATITUD': 4.0066388890, 'LONGITUD': -75.607750}
-}
-
-# ---------------------------------------------------------
-# 2. PROCESAMIENTO GEOMÉTRICO (Solución a interpolación incompleta)
-# ---------------------------------------------------------
-print("--- Procesando Geometría ---")
-if os.path.exists(RUTA_SHP):
-    gdf_raw = gpd.read_file(RUTA_SHP)
-    if NOMBRE_COLUMNA_SHP in gdf_raw.columns:
-        gdf_cuenca = gdf_raw[gdf_raw[NOMBRE_COLUMNA_SHP] == NOMBRE_CUENCA_OBJETIVO].copy()
-        if gdf_cuenca.empty: gdf_cuenca = gdf_raw
-    else:
-        gdf_cuenca = gdf_raw
-
-    # Reproyectar para área
-    gdf_metros = gdf_cuenca.to_crs(epsg=3116)
-    AREA_M2 = gdf_metros.area.sum()
-    gdf_cuenca = gdf_cuenca.to_crs(epsg=4326) # Volver a WGS84
-
-    # --- CORRECCIÓN DE LÍMITES ---
-    # Usamos los límites del SHAPEFILE, no de las estaciones, para evitar huecos blancos
-    bounds = gdf_cuenca.total_bounds # [minx, miny, maxx, maxy]
-    # Agregamos un 10% de margen para asegurar cobertura total
-    margin_x = (bounds[2] - bounds[0]) * 0.1
-    margin_y = (bounds[3] - bounds[1]) * 0.1
-    xlim_min, ylim_min = bounds[0] - margin_x, bounds[1] - margin_y
-    xlim_max, ylim_max = bounds[2] + margin_x, bounds[3] + margin_y
-else:
-    print("❌ Error: No se encontró el SHP.")
-    gdf_cuenca = None
-    xlim_min, xlim_max, ylim_min, ylim_max = -76, -74, 3, 5
-    AREA_M2 = 0
-
-# ---------------------------------------------------------
-# 3. CARGA DE DATOS
-# ---------------------------------------------------------
-print("--- Procesando Datos ---")
-csv_files = [f for f in os.listdir(FOLDER_PATH) if f.endswith('.csv')]
-data_frames = []
-
-for file in csv_files:
-    if '@' in file: station_id = file.split('@')[1].split('.')[0]
-    else: station_id = file.replace('.csv', '')
-
-    if station_id not in estaciones_info: continue
-
-    try:
-        df = pd.read_csv(os.path.join(FOLDER_PATH, file), skiprows=14, encoding='latin-1', sep=',')
-        df.columns = df.columns.str.strip()
-        
-        if 'Value' in df.columns:
-            df['Fecha'] = pd.to_datetime(df['Timestamp (UTC-05:00)'], errors='coerce')
-            df['Valor'] = pd.to_numeric(df['Value'], errors='coerce')
-            if FILTRAR_FECHA:
-                df = df[(df['Fecha'] >= FECHA_INICIO) & (df['Fecha'] <= FECHA_FIN)]
-            
-            df['Estacion'] = station_id
-            df['Mes'] = df['Fecha'].dt.month
-            df['Anio'] = df['Fecha'].dt.year
-            data_frames.append(df[['Fecha', 'Anio', 'Mes', 'Valor', 'Estacion']])
-    except: pass
-
-df_all = pd.concat(data_frames)
-
-# Agrupamos por Estación, Año y Mes (Acumulado Mensual Real)
-df_mensual_historico = df_all.groupby(['Estacion', 'Anio', 'Mes'])['Valor'].sum().reset_index()
-
-# Añadimos metadatos
-df_mensual_historico['Nombre_Est'] = df_mensual_historico['Estacion'].apply(lambda x: estaciones_info[x]['NOMBRE'])
-df_mensual_historico['Nombre_Mes'] = df_mensual_historico['Mes'].apply(lambda x: NOMBRES_MESES[x-1])
-
-# ---------------------------------------------------------
-# 4. GRÁFICOS ESTADÍSTICOS MEJORADOS
-# ---------------------------------------------------------
-print("--- Generando Gráficos Estadísticos ---")
-
-fig, axes = plt.subplots(1, 2, figsize=(16, 7))
-
-# --- GRÁFICA 1: BOXPLOT (Dispersión y Valores Atípicos) ---
-sns.boxplot(data=df_mensual_historico, x='Nombre_Mes', y='Valor', palette='Blues', ax=axes[0], flierprops={"marker": "x"})
-axes[0].set_title('Dispersión de la Precipitación Mensual Multianual\n(Boxplot)', fontsize=12, fontweight='bold')
-axes[0].set_ylabel('Precipitación (mm)')
-axes[0].set_xlabel('')
-axes[0].grid(True, linestyle='--', alpha=0.5)
-
-# --- GRÁFICA 2: RÉGIMEN MEDIO (Promedios Mensuales) ---
-# Calculamos la media y mediana multianual por mes (promedio de todas las estaciones y años)
-df_regimen = df_mensual_historico.groupby('Mes')['Valor'].agg(['mean', 'median']).reset_index()
-df_regimen['Nombre_Mes'] = df_regimen['Mes'].apply(lambda x: NOMBRES_MESES[x-1])
-
-# Barras: Promedio
-barplot = sns.barplot(data=df_regimen, x='Nombre_Mes', y='mean', color='skyblue', alpha=0.7, ax=axes[1], label='Media (Promedio)')
-# Línea: Mediana (Tendencia central más robusta)
-axes[1].plot(df_regimen.index, df_regimen['median'], color='darkblue', marker='o', linewidth=2, linestyle='-', label='Mediana')
-
-axes[1].set_title('Régimen de Precipitación Medio Mensual\n(Comportamiento Promedio)', fontsize=12, fontweight='bold')
-axes[1].set_ylabel('Precipitación (mm)')
-axes[1].set_xlabel('')
-axes[1].legend()
-axes[1].grid(True, linestyle='--', alpha=0.5)
-
-# Anotación de valores sobre las barras
-for index, row in df_regimen.iterrows():
-    axes[1].text(index, row['mean'] + 5, f"{int(row['mean'])}", color='black', ha="center", fontsize=9)
-
-plt.tight_layout()
-plt.show()
-
-# ---------------------------------------------------------
-# 5. CÁLCULO DE CAUDALES (Q = P * A * C)
-# ---------------------------------------------------------
-# Promedio espacial por mes (para el cálculo de Q)
-df_climatologia = df_mensual_historico.groupby('Mes')['Valor'].mean().reset_index()
-dias_mes = {1:31, 2:28.25, 3:31, 4:30, 5:31, 6:30, 7:31, 8:31, 9:30, 10:31, 11:30, 12:31} # 28.25 para promedio bisiesto
-
-caudales = []
-for i, row in df_climatologia.iterrows():
-    mes = int(row['Mes'])
-    ppt_mm = row['Valor'] # Precipitación media histórica del mes
-    
-    ppt_m = ppt_mm / 1000.0
-    segundos = dias_mes[mes] * 86400
-    q_medio = (ppt_m / segundos) * AREA_M2 * COEF_ESCORRENTIA
-    
-    caudales.append({'Mes': NOMBRES_MESES[mes-1], 'P_mm': ppt_mm, 'Q_m3s': q_medio})
-
-df_Q = pd.DataFrame(caudales)
-print("\n--- Caudales Medios Estimados ---")
-print(df_Q)
-
-# ---------------------------------------------------------
-# 6. MAPAS MENSUALES (Corregidos)
-# ---------------------------------------------------------
-print("\n--- Generando Mapas ---")
-
-# Grid basado en el SHAPEFILE (Más amplio para evitar huecos)
-grid_x, grid_y = np.meshgrid(np.linspace(xlim_min, xlim_max, 200), 
-                             np.linspace(ylim_min, ylim_max, 200))
-
-# Máscara (Clipping)
-if gdf_cuenca is not None:
-    poly_union = gdf_cuenca.unary_union
-    points = np.vstack((grid_x.flatten(), grid_y.flatten())).T
-    if poly_union.geom_type == 'MultiPolygon':
-        mask = np.zeros(grid_x.shape, dtype=bool).flatten()
-        for poly in poly_union.geoms:
-            mask = mask | Path(np.array(poly.exterior.coords)).contains_points(points)
-    else:
-        mask = Path(np.array(poly_union.exterior.coords)).contains_points(points)
-    mask = mask.reshape(grid_x.shape)
-
-# Datos para interpolar: Promedio Multianual por Estación y Mes
-df_mapas = df_mensual_historico.groupby(['Estacion', 'Mes'])['Valor'].mean().reset_index()
-df_mapas['Lat'] = df_mapas['Estacion'].apply(lambda x: estaciones_info[x]['LATITUD'])
-df_mapas['Lon'] = df_mapas['Estacion'].apply(lambda x: estaciones_info[x]['LONGITUD'])
-
-fig, axes = plt.subplots(4, 3, figsize=(15, 18))
-axes = axes.flatten()
-
-for mes in range(1, 13):
-    ax = axes[mes-1]
-    nombre_mes = NOMBRES_MESES[mes-1]
-    
-    # Datos del mes actual
-    df_m = df_mapas[df_mapas['Mes'] == mes]
-    
-    if len(df_m) < 3:
-        ax.text(0.5, 0.5, 'Datos insuficientes', ha='center'); continue
-
-    try:
-        # Interpolación RBF
-        rbf = Rbf(df_m['Lon'], df_m['Lat'], df_m['Valor'], function='thin_plate')
-        grid_z = rbf(grid_x, grid_y)
-        
-        if gdf_cuenca is not None: grid_z[~mask] = np.nan
-        
-        # Graficar
-        niveles = np.linspace(df_m['Valor'].min(), df_m['Valor'].max(), 12)
-        cf = ax.contourf(grid_x, grid_y, grid_z, levels=niveles, cmap='Spectral_r', alpha=0.9)
-        
-        # Shapefile borde
-        if gdf_cuenca is not None:
-            gdf_cuenca.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=0.7)
-            
-        # Puntos
-        ax.scatter(df_m['Lon'], df_m['Lat'], c='black', s=10)
-        
-        # Barra de color individual pequeña
-        cbar = plt.colorbar(cf, ax=ax, shrink=0.6)
-        cbar.ax.tick_params(labelsize=7)
-        
-        ax.set_title(nombre_mes, fontweight='bold')
-        ax.set_xticks([]); ax.set_yticks([])
-        ax.set_aspect('equal')
-        
-    except Exception as e:
-        print(f"Error mes {mes}: {e}")
-
-plt.suptitle(f'Distribución Espacial Media Mensual - {NOMBRE_CUENCA_OBJETIVO}\nPeriodo: {FECHA_INICIO} al {FECHA_FIN}', fontsize=16, y=0.99)
-plt.tight_layout()
-plt.show()
-
-
-# In[6]:
-
-
-import xarray as xr
 import pandas as pd
 import numpy as np
 import matplotlib.pyplot as plt
-import geopandas as gpd
-from scipy.interpolate import Rbf
-from matplotlib.path import Path
-import os
-from datetime import datetime, timedelta
+from pathlib import Path
+import warnings
+
+warnings.filterwarnings("ignore")
 
 # ---------------------------------------------------------
 # 1. CONFIGURACIÓN
 # ---------------------------------------------------------
-# Ruta del Shapefile (La misma que ya te funcionó)
-RUTA_SHP = r'C:\Users\masan\OneDrive\Documentos\Maestria Meteo\2025-II\HIDROMETEOROLOGIA\Cuenca\Datos_Estaciones\Subzonas_Hidrográficas_del_Departamento_del_Tolima.shp'
-NOMBRE_COLUMNA_SHP = 'SUBZONA_HI'
-NOMBRE_CUENCA_OBJETIVO = 'Rio Cucuana'
+FOLDER_PATH = r'C:\Users\masan\OneDrive\Documentos\Maestria Meteo\2025-II\HIDROMETEOROLOGIA\Cuenca\Estaciones pluvio'
 
-# Parámetros Hidrológicos
-COEF_ESCORRENTIA = 0.65
+# Periodo de Análisis
+FECHA_INICIO = '2000-01-01'
+FECHA_FIN = '2020-12-31'
 
-# URL del Servidor de Datos (GFS 0.25 grados - "Best Time Series" de Unidata)
-# Este enlace siempre apunta a la mejor serie de tiempo disponible combinada
-GFS_URL = 'https://thredds.ucar.edu/thredds/dodsC/grib/NCEP/GFS/Global_0p25deg/Best'
+# Parámetros Thornthwaite
+CAPACIDAD_CAMPO_THORNTHWAITE = 100.0  # mm (Para balance de suelos agrícola)
 
-# ---------------------------------------------------------
-# 2. CARGAR Y PREPARAR LA CUENCA
-# ---------------------------------------------------------
-print("--- Cargando Geometría de la Cuenca ---")
-if os.path.exists(RUTA_SHP):
-    gdf_raw = gpd.read_file(RUTA_SHP)
-    if NOMBRE_COLUMNA_SHP in gdf_raw.columns:
-        gdf_cuenca = gdf_raw[gdf_raw[NOMBRE_COLUMNA_SHP] == NOMBRE_CUENCA_OBJETIVO].copy()
-        if gdf_cuenca.empty: gdf_cuenca = gdf_raw
-    else:
-        gdf_cuenca = gdf_raw
+# Parámetros Modelo ABCD (Teóricos - Ajustar si hay datos de caudal)
+# a: Propensión a escorrentía (0-1). 0.98 es usual para cuencas con buena infiltración inicial.
+# b: Límite superior de almacenamiento (mm). Similar a capacidad de campo pero suele ser mayor.
+# c: Factor de recarga subterránea (0-1). Cuanto va al acuífero.
+# d: Constante de recesión flujo base (0-1). Inverso del tiempo de residencia.
+PARAMETROS_ABCD = {'a': 0.98, 'b': 250.0, 'c': 0.4, 'd': 0.2}
 
-    # Calcular Área
-    gdf_metros = gdf_cuenca.to_crs(epsg=3116)
-    AREA_M2 = gdf_metros.area.sum()
-    gdf_cuenca = gdf_cuenca.to_crs(epsg=4326) # WGS84
-    
-    # Obtener límites para recortar el GFS (con margen)
-    bounds = gdf_cuenca.total_bounds
-    min_lon, min_lat, max_lon, max_lat = bounds
-    # Margen de 0.5 grados para asegurar que el GFS cubra la zona
-    buffer = 0.5
-    lat_slice = slice(max_lat + buffer, min_lat - buffer) # GFS suele ir de Norte a Sur
-    lon_slice = slice(min_lon - buffer, max_lon + buffer)
-    
-    print(f"✅ Cuenca: {NOMBRE_CUENCA_OBJETIVO} | Área: {AREA_M2/1e6:.2f} km²")
-else:
-    print("❌ Error: No se encontró el Shapefile.")
-    exit()
+NOMBRES_MESES = ['Ene', 'Feb', 'Mar', 'Abr', 'May', 'Jun', 'Jul', 'Ago', 'Sep', 'Oct', 'Nov', 'Dic']
+KEYS_TEMP = ['ENE', 'FEB', 'MAR', 'ABR', 'MAY', 'JUN', 'JUL', 'AGO', 'SEP', 'OCT', 'NOV', 'DIC']
+
+# Diccionario de Estaciones (Temperaturas)
+estaciones_info = {
+  "22075030": { "NOMBRE": "RIOMANSO", "LATITUD": 4.206777778, "LONGITUD": -75.41558333,
+    "TEMP_MENSUAL": {"ENE": 25.3, "FEB": 25.1, "MAR": 24.6, "ABR": 23.8, "MAY": 22.9, "JUN": 21.5, "JUL": 21.1, "AGO": 21.7, "SEP": 22.4, "OCT": 23.2, "NOV": 22.7, "DIC": 24.1}},
+  "22060090": { "NOMBRE": "OLAYA HERRERA", "LATITUD": 3.81989, "LONGITUD": -75.3284,
+    "TEMP_MENSUAL": {"ENE": 28.7, "FEB": 28.4, "MAR": 27.9, "ABR": 27.1, "MAY": 26.2, "JUN": 25.0, "JUL": 24.7, "AGO": 25.1, "SEP": 26.0, "OCT": 26.8, "NOV": 25.9, "DIC": 27.5}},
+  "22060070": { "NOMBRE": "ORTEGA", "LATITUD": 3.92929, "LONGITUD": -75.22135,
+    "TEMP_MENSUAL": {"ENE": 27.9, "FEB": 27.6, "MAR": 27.1, "ABR": 26.4, "MAY": 25.3, "JUN": 24.1, "JUL": 23.8, "AGO": 24.3, "SEP": 25.2, "OCT": 26.1, "NOV": 25.5, "DIC": 26.8}},
+  "22070030": { "NOMBRE": "SANTA HELENA", "LATITUD": 4.124555556, "LONGITUD": -75.49952778,
+    "TEMP_MENSUAL": {"ENE": 22.8, "FEB": 22.5, "MAR": 22.0, "ABR": 21.3, "MAY": 20.4, "JUN": 19.2, "JUL": 18.7, "AGO": 19.4, "SEP": 20.1, "OCT": 21.0, "NOV": 20.6, "DIC": 21.8}},
+  "21180040": { "NOMBRE": "ROVIRA 2", "LATITUD": 4.2425, "LONGITUD": -75.2425,
+    "TEMP_MENSUAL": {"ENE": 23.4, "FEB": 23.1, "MAR": 22.7, "ABR": 21.8, "MAY": 21.0, "JUN": 19.9, "JUL": 19.4, "AGO": 20.0, "SEP": 20.7, "OCT": 21.5, "NOV": 21.2, "DIC": 22.6}},
+  "22070010": { "NOMBRE": "RONCESVALLES", "LATITUD": 4.006638889, "LONGITUD": -75.60775,
+    "TEMP_MENSUAL": {"ENE": 18.4, "FEB": 18.1, "MAR": 17.7, "ABR": 17.1, "MAY": 16.4, "JUN": 15.8, "JUL": 15.6, "AGO": 16.0, "SEP": 16.5, "OCT": 17.2, "NOV": 17.0, "DIC": 17.9}}
+}
 
 # ---------------------------------------------------------
-# 3. DESCARGA DE DATOS GFS (OPeNDAP)
+# 2. FUNCIONES DE LECTURA Y UTILIDADES
 # ---------------------------------------------------------
-print("\n--- Conectando al Servidor GFS (NOAA/Unidata) ---")
-print("Esto puede tardar unos segundos dependiendo de tu internet...")
-
-try:
-    # Conectamos remotamente
-    ds = xr.open_dataset(GFS_URL)
-    
-    # 1. Seleccionamos variable: 'Precipitation_rate_surface' (kg/m^2/s)
-    # Nota: GFS a veces cambia nombres, pero en THREDDS suele ser este.
-    # Convertiremos Tasa (mm/s) a Acumulado (mm) multiplicando por el tiempo.
-    
-    # 2. Recortamos Espacialmente (Slicing) para no bajar todo el mundo
-    # GFS usa longitudes 0-360. Colombia (-75) es 360-75 = 285.
-    # Ajuste automático de longitud si es necesario
-    if ds.lon.max() > 180:
-        lon_slice_gfs = slice((min_lon - buffer) + 360, (max_lon + buffer) + 360)
-    else:
-        lon_slice_gfs = lon_slice
-
-    # 3. Recortamos Temporalmente (Próximas 72 horas)
-    # Buscamos el tiempo inicial más reciente
-    t_start = datetime.utcnow()
-    t_end = t_start + timedelta(hours=72)
-    
-    # Descargamos el subset
-    subset = ds['Precipitation_rate_surface'].sel(
-        lat=lat_slice,
-        lon=lon_slice_gfs,
-        time=slice(t_start, t_end)
-    )
-    
-    # Cargar en memoria para procesar rápido
-    print("Descargando subset de datos...")
-    data = subset.load()
-    
-    # Corregir longitud a -180/180 para el mapa
-    if data.lon.max() > 180:
-        data.coords['lon'] = (data.coords['lon'] + 180) % 360 - 180
-        data = data.sortby('lon')
-        
-    print("✅ Datos GFS descargados exitosamente.")
-
-except Exception as e:
-    print(f"❌ Error descargando GFS: {e}")
-    # Datos simulados por si falla la conexión (para que veas el código funcionar)
-    print("Generando datos dummy para demostración...")
-    lat = np.linspace(min_lat-0.2, max_lat+0.2, 10)
-    lon = np.linspace(min_lon-0.2, max_lon+0.2, 10)
-    times = pd.date_range(start=datetime.now(), periods=25, freq='3H') # Cada 3h hasta 72h
-    data = xr.DataArray(np.random.rand(25, 10, 10) * 0.0001, coords=[times, lat, lon], dims=['time', 'lat', 'lon'])
-
-# ---------------------------------------------------------
-# 4. CÁLCULO DE ACUMULADOS (24, 48, 72 HORAS)
-# ---------------------------------------------------------
-print("\n--- Procesando Pronósticos (24h, 48h, 72h) ---")
-
-horizontes = [24, 48, 72]
-resultados = []
-
-for h in horizontes:
-    t_fin_h = data.time[0] + np.timedelta64(h, 'h')
-    
-    # Filtramos las primeras 'h' horas
-    slice_h = data.sel(time=slice(data.time[0], t_fin_h))
-    
-    # --- CONVERSIÓN FÍSICA ---
-    # El dato viene en kg/m^2/s (mm/s). Debemos integrar en el tiempo.
-    # Método simple: Promedio de tasa * segundos totales
-    tasa_media = slice_h.mean(dim='time') # mm/s promedio en el periodo
-    segundos = h * 3600
-    acumulado_mm = tasa_media * segundos # Total mm en h horas
-    
-    resultados.append({
-        'Hora': h,
-        'Grid': acumulado_mm, # Xarray DataArray 2D
-        'Max_Ppt': acumulado_mm.max().item(),
-        'Mean_Ppt': acumulado_mm.mean().item()
-    })
-
-# ---------------------------------------------------------
-# 5. CÁLCULO DE CAUDALES
-# ---------------------------------------------------------
-print("\n--- Estimación de Caudales Pronosticados ---")
-print(f"{'Horizonte':<10} | {'Ppt Media (mm)':<15} | {'Caudal Medio (m³/s)':<20}")
-print("-" * 50)
-
-for res in resultados:
-    ppt_media_mm = res['Mean_Ppt']
-    
-    # Q = (Ppt_metros / segundos) * Area * C
-    ppt_m = ppt_media_mm / 1000.0
-    segundos = res['Hora'] * 3600
-    
-    # Intensidad promedio durante el periodo de pronóstico
-    intensidad = ppt_m / segundos
-    
-    q_pronostico = intensidad * AREA_M2 * COEF_ESCORRENTIA
-    
-    res['Q_Est'] = q_pronostico
-    print(f"{res['Hora']} Horas   | {ppt_media_mm:.2f} mm        | {q_pronostico:.3f} m³/s")
-
-# ---------------------------------------------------------
-# 6. GENERACIÓN DE MAPAS
-# ---------------------------------------------------------
-print("\n--- Generando Mapas de Pronóstico ---")
-
-# Preparamos la malla para interpolar (para suavizar los pixeles grandes del GFS)
-grid_x, grid_y = np.meshgrid(np.linspace(min_lon, max_lon, 200), 
-                             np.linspace(min_lat, max_lat, 200))
-
-# Máscara de Cuenca
-poly_union = gdf_cuenca.unary_union
-points = np.vstack((grid_x.flatten(), grid_y.flatten())).T
-if poly_union.geom_type == 'MultiPolygon':
-    mask = np.zeros(grid_x.shape, dtype=bool).flatten()
-    for poly in poly_union.geoms:
-        mask = mask | Path(np.array(poly.exterior.coords)).contains_points(points)
-else:
-    mask = Path(np.array(poly_union.exterior.coords)).contains_points(points)
-mask = mask.reshape(grid_x.shape)
-
-# Graficar
-fig, axes = plt.subplots(1, 3, figsize=(18, 6))
-
-for i, res in enumerate(resultados):
-    ax = axes[i]
-    da = res['Grid'] # DataArray del GFS
-    
-    # Extraer lat/lon/valores del GFS para interpolar
-    # Aplanamos los arrays
-    gfs_lats, gfs_lons = np.meshgrid(da.lat, da.lon, indexing='ij')
-    vals = da.values.flatten()
-    lats_flat = gfs_lats.flatten()
-    lons_flat = gfs_lons.flatten()
-    
+def leer_y_promediar_precipitacion(path):
+    """
+    Lee histórico, filtra fecha y calcula promedio mensual multianual.
+    """
     try:
-        # Interpolación para suavizar
-        rbf = Rbf(lons_flat, lats_flat, vals, function='linear') # Linear es más seguro aquí
-        grid_z = rbf(grid_x, grid_y)
-        grid_z[~mask] = np.nan # Enmascarar
+        try: df = pd.read_csv(path, encoding='utf-8', skiprows=14)
+        except: df = pd.read_csv(path, encoding='latin1', skiprows=14)
         
-        # Plot
-        niveles = np.linspace(0, max(vals.max(), 1), 10) # Evitar error si todo es 0
-        cf = ax.contourf(grid_x, grid_y, grid_z, levels=niveles, cmap='YlGnBu')
+        if df.empty or len(df.columns) < 2:
+            df = pd.read_csv(path, encoding='latin1')
+
+        df.columns = df.columns.str.strip()
         
-        if gdf_cuenca is not None:
-            gdf_cuenca.plot(ax=ax, facecolor='none', edgecolor='black', linewidth=1)
-            
-        cbar = plt.colorbar(cf, ax=ax, shrink=0.6)
-        cbar.set_label('mm Acumulados')
+        col_fecha = next((c for c in df.columns if 'fecha' in c.lower() or 'date' in c.lower() or 'timestamp' in c.lower()), None)
+        col_valor = next((c for c in df.columns if any(x in c.lower() for x in ['precip', 'valor', 'value', 'rain', 'lluvia'])), None)
+
+        if not col_fecha or not col_valor: return None
+
+        df[col_fecha] = pd.to_datetime(df[col_fecha], errors='coerce')
+        df[col_valor] = pd.to_numeric(df[col_valor], errors='coerce')
+        df = df.dropna(subset=[col_fecha, col_valor])
         
-        # Texto
-        ax.set_title(f"Pronóstico Acumulado {res['Hora']}h\nQ Est: {res['Q_Est']:.1f} m³/s")
-        ax.set_xticks([]); ax.set_yticks([])
+        df = df[(df[col_fecha] >= FECHA_INICIO) & (df[col_fecha] <= FECHA_FIN)]
         
+        df['anio'] = df[col_fecha].dt.year
+        df['mes'] = df[col_fecha].dt.month
+        
+        # Suma mensual por año y luego promedio de esos sumatorios
+        mensual_por_anio = df.groupby(['anio', 'mes'])[col_valor].sum().reset_index()
+        promedio_climatologico = mensual_por_anio.groupby('mes')[col_valor].mean().sort_index()
+        promedio_climatologico = promedio_climatologico.reindex(range(1,13), fill_value=0)
+        
+        return promedio_climatologico.values
     except Exception as e:
-        ax.text(0.5, 0.5, f"Error: {e}", ha='center')
-        print(f"Error graficando {res['Hora']}h: {e}")
+        print(f"  [!] Error leyendo {path.name}: {e}")
+        return None
 
-plt.suptitle(f"Pronóstico GFS (Precipitación) - {NOMBRE_CUENCA_OBJETIVO}\nInicio: {datetime.now().strftime('%Y-%m-%d %H:00')}", fontsize=16)
-plt.tight_layout()
-plt.show()
+def calcular_factor_latitud(latitud, mes_num):
+    dias_mes = [0, 31, 28.25, 31, 30, 31, 30, 31, 31, 30, 31, 30, 31]
+    phi = np.radians(latitud)
+    delta = 0.409 * np.sin(2 * np.pi * mes_num / 12 - 1.39)
+    try:
+        omega = np.arccos(-np.tan(phi) * np.tan(delta))
+        N = 24 / np.pi * omega
+    except: N = 12
+    return (N / 12) * (dias_mes[mes_num] / 30)
 
+# ---------------------------------------------------------
+# 3. MODELOS HIDROLÓGICOS
+# ---------------------------------------------------------
 
-# In[ ]:
+def ejecutar_thornthwaite_y_abcd(P_med, T_med, latitud, cap_th, params_abcd):
+    """
+    Ejecuta ambos modelos sobre el año promedio climatológico.
+    """
+    # --- A. PREPARAR DATOS Y PET ---
+    df = pd.DataFrame({'Mes_Num': range(1,13), 'Mes': NOMBRES_MESES, 'P_mm': P_med, 'T_C': T_med})
+    
+    I_anual = np.sum((np.array(T_med) / 5) ** 1.514)
+    a_th = (6.75e-7 * I_anual**3) - (7.71e-5 * I_anual**2) + (1.792e-2 * I_anual) + 0.49239
+    
+    df['Et_raw'] = 16 * ((10 * df['T_C']) / I_anual) ** a_th
+    df['F_Lat'] = df['Mes_Num'].apply(lambda x: calcular_factor_latitud(latitud, x))
+    df['PET_mm'] = df['Et_raw'] * df['F_Lat']
+    
+    # --- B. BALANCE THORNTHWAITE (Clásico para Clasificación) ---
+    alm_prev = cap_th
+    # Calentamiento TH
+    for _ in range(3):
+        for idx in range(12):
+            diff = df.loc[idx, 'P_mm'] - df.loc[idx, 'PET_mm']
+            nuevo = min(max(alm_prev + diff, 0), cap_th)
+            alm_prev = nuevo
+            
+    # Ejecución TH
+    th_alm, th_etr, th_exc, th_def = [], [], [], []
+    for i in range(12):
+        diff = df.loc[i, 'P_mm'] - df.loc[i, 'PET_mm']
+        nuevo = min(max(alm_prev + diff, 0), cap_th)
+        da = nuevo - alm_prev
+        
+        if diff >= 0:
+            etr = df.loc[i, 'PET_mm']
+            exc = diff - da
+            dft = 0
+        else:
+            etr = df.loc[i, 'P_mm'] + abs(da)
+            exc = 0
+            dft = df.loc[i, 'PET_mm'] - etr
+            
+        th_alm.append(nuevo)
+        th_etr.append(etr)
+        th_exc.append(exc)
+        th_def.append(dft)
+        alm_prev = nuevo
+        
+    df['TH_Alm'] = th_alm
+    df['TH_Etr'] = th_etr
+    df['TH_Def'] = th_def
+    df['TH_Exc'] = th_exc # Exceso climático (no necesariamente caudal)
 
+    # --- C. MODELO ABCD (Para Caudales) ---
+    a = params_abcd['a']
+    b = params_abcd['b']
+    c = params_abcd['c']
+    d = params_abcd['d']
+    
+    # Estados Iniciales (Arbitrarios, se estabilizan con warm-up)
+    S_abcd = b / 2  # Almacenamiento Suelo
+    G_abcd = 100    # Almacenamiento Acuífero
+    
+    # Calentamiento ABCD (3 años)
+    for _ in range(3):
+        for i in range(12):
+            P = df.loc[i, 'P_mm']
+            PET = df.loc[i, 'PET_mm']
+            
+            # Agua disponible total
+            W = P + S_abcd
+            
+            # Oportunidad de pérdida (Y) - Fórmula no lineal de Thomas
+            # Y representa (Etr + S_nuevo)
+            term1 = (W + b) / (2 * a)
+            term2 = (W * b) / a
+            # Evitar raices negativas en casos extremos
+            disc = term1**2 - term2
+            if disc < 0: Y = W
+            else: Y = term1 - np.sqrt(disc)
+            
+            # Nuevo almacenamiento suelo
+            S_new = Y * np.exp(-PET / b)
+            
+            # Agua disponible para escorrentía (Detention)
+            # Lo que no se evapora ni se queda en el suelo, baja.
+            avail = W - Y 
+            
+            # Partición (Recharge vs Direct Runoff)
+            rech = c * avail
+            
+            # Acuífero
+            G_new = (rech + G_abcd) / (1 + d)
+            
+            # Actualizar
+            S_abcd = S_new
+            G_abcd = G_new
 
+    # Ejecución ABCD (Guardando datos)
+    abcd_S, abcd_G = [], []
+    q_direct, q_base, q_total = [], [], []
+    abcd_etr = []
+    
+    for i in range(12):
+        P = df.loc[i, 'P_mm']
+        PET = df.loc[i, 'PET_mm']
+        
+        W = P + S_abcd
+        
+        term1 = (W + b) / (2 * a)
+        term2 = (W * b) / a
+        disc = term1**2 - term2
+        if disc < 0: Y = W
+        else: Y = term1 - np.sqrt(disc)
+        
+        S_new = Y * np.exp(-PET / b)
+        E_real = Y - S_new # Evapotranspiración Real ABCD
+        
+        avail = W - Y # Agua sobrante del tanque superior
+        
+        Q_dir = (1 - c) * avail # Escorrentía Directa
+        Rech = c * avail        # Recarga
+        
+        # Tanque inferior
+        G_new = (Rech + G_abcd) / (1 + d)
+        Q_bas = d * G_new       # Flujo Base
+        
+        # Guardar
+        abcd_S.append(S_new)
+        abcd_G.append(G_new)
+        q_direct.append(Q_dir)
+        q_base.append(Q_bas)
+        q_total.append(Q_dir + Q_bas)
+        abcd_etr.append(E_real)
+        
+        # Actualizar
+        S_abcd = S_new
+        G_abcd = G_new
+        
+    df['ABCD_S'] = abcd_S
+    df['ABCD_G'] = abcd_G
+    df['Q_Directo'] = q_direct
+    df['Q_Base'] = q_base
+    df['Q_Total'] = q_total
+    
+    return df
 
+def graficar_integrado(df, nombre_estacion, im_val, output_path):
+    """Gráfica que combina Balance Climático (Áreas) y Caudal Simulado (Línea)."""
+    fig, ax = plt.subplots(figsize=(11, 6))
+    x = range(1, 13)
+    
+    # 1. Fondo: Balance Thornthwaite (Exceso/Déficit Climático)
+    ax.fill_between(x, df['P_mm'], df['PET_mm'], where=(df['P_mm'] > df['PET_mm']),
+                    interpolate=True, color='dodgerblue', alpha=0.2, label='Exceso Climático (Thornthwaite)')
+    ax.fill_between(x, df['P_mm'], df['PET_mm'], where=(df['P_mm'] <= df['PET_mm']),
+                    interpolate=True, color='crimson', alpha=0.2, label='Déficit Climático')
+    
+    # 2. Líneas Principales
+    ax.plot(x, df['P_mm'], marker='o', color='royalblue', linewidth=2, label='Precipitación (P)')
+    ax.plot(x, df['PET_mm'], linestyle='--', color='firebrick', label='PET (Thornthwaite)')
+    
+    # 3. Caudal ABCD
+    ax.plot(x, df['Q_Total'], color='black', linewidth=2.5, linestyle='-', marker='s', markersize=5, label='Caudal Simulado (Q Total ABCD)')
+    ax.plot(x, df['Q_Base'], color='gray', linewidth=1.5, linestyle=':', label='Flujo Base (Acuífero)')
+    
+    clasif = "Húmedo" if im_val > 0 else "Seco"
+    ax.set_title(f"Balance Hídrico y Caudales (ABCD)\nEstación: {nombre_estacion} (Im={im_val:.1f})", fontsize=12)
+    ax.set_xticks(x)
+    ax.set_xticklabels(NOMBRES_MESES)
+    ax.set_ylabel("Lámina de Agua (mm)")
+    
+    # Leyenda fuera para no tapar
+    ax.legend(loc='upper center', bbox_to_anchor=(0.5, -0.1), ncol=3)
+    ax.grid(True, linestyle='--', alpha=0.5)
+    
+    plt.tight_layout()
+    plt.savefig(output_path, dpi=150)
+    plt.close()
 
+# ---------------------------------------------------------
+# 4. PROCESO PRINCIPAL
+# ---------------------------------------------------------
+def main():
+    folder = Path(FOLDER_PATH)
+    if not folder.exists(): return print("Error: Carpeta no encontrada.")
+
+    out_dir = folder / "Reporte_Multianual_ABCD"
+    out_dir.mkdir(exist_ok=True)
+    
+    print("--- GENERANDO REPORTE INTEGRADO (Thornthwaite + ABCD) ---")
+    
+    archivos_todos = []
+    for ext in ('*.csv','*.CSV','*.xlsx','*.xls'):
+        archivos_todos.extend(list(folder.rglob(ext)))
+    archivos_map = {f.name.lower(): f for f in archivos_todos}
+    
+    # Excel Consolidado
+    excel_path = out_dir / "Consolidado_Hidrologico.xlsx"
+    try: writer_excel = pd.ExcelWriter(excel_path)
+    except: writer_excel = None
+    
+    count = 0
+    for codigo, info in estaciones_info.items():
+        nombre = info['NOMBRE']
+        print(f"Procesando: {nombre}...")
+        
+        f_path = next((v for k, v in archivos_map.items() if codigo in k or nombre.lower() in k), None)
+        if not f_path:
+            print("  [X] Archivo no encontrado.")
+            continue
+            
+        P_med = leer_y_promediar_precipitacion(f_path)
+        if P_med is None: continue
+        
+        T_med = [info['TEMP_MENSUAL'][k] for k in KEYS_TEMP]
+        
+        # EJECUTAR MODELOS
+        df_res = ejecutar_thornthwaite_y_abcd(
+            P_med, T_med, info['LATITUD'], 
+            CAPACIDAD_CAMPO_THORNTHWAITE, PARAMETROS_ABCD
+        )
+        
+        # Indices Climáticos (Usando salidas de Thornthwaite para clasificación)
+        sum_exc = df_res['TH_Exc'].sum()
+        sum_def = df_res['TH_Def'].sum()
+        sum_pet = df_res['PET_mm'].sum()
+        im_val = (100 * sum_exc - 60 * sum_def) / sum_pet if sum_pet > 0 else 0
+        
+        # Guardar CSV
+        df_res.round(2).to_csv(out_dir / f"Datos_{nombre}.csv", index=False)
+        
+        # Generar Gráfica Integrada
+        graficar_integrado(df_res, nombre, im_val, out_dir / f"Grafica_{nombre}.png")
+        
+        # Guardar Excel
+        if writer_excel:
+            try:
+                sheet = nombre.replace('[','').replace(']','')[:30]
+                df_res.round(2).to_excel(writer_excel, sheet_name=sheet, index=False)
+            except: pass
+            
+        print(f"  -> OK. Q_Total Anual Est.: {df_res['Q_Total'].sum():.1f} mm")
+        count += 1
+        
+    if writer_excel:
+        writer_excel.close()
+        print(f"\nResultados guardados en: {out_dir}")
+
+if __name__ == "__main__":
+    main()
+    
